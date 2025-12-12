@@ -13,7 +13,6 @@ on:
       - '**.tf'
       - '**.hcl'
       - 'modules/**'
-      - 'README.md'
 
 env:
   AWS_REGION: ap-northeast-2
