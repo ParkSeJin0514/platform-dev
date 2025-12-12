@@ -3,6 +3,7 @@
 # ============================================================================
 # Terraform/Terragrunt 인프라 삭제 워크플로우
 # - Karpenter 완전 강제 삭제 (Controller, NodeClaim, NodePool, EC2NodeClass, CRD)
+# - Ingress Finalizer 제거 후 삭제 (ALB 정리)
 # - AWS CLI로 직접 리소스 삭제 (EKS, RDS, EC2, NAT, ENI 등)
 # - Terragrunt destroy 실행
 # ============================================================================
@@ -546,45 +547,122 @@ jobs:
           echo "✅ External Secrets 정리 완료"
 
       # ========================================================================
-      # Ingress 및 ALB 정리
+      # Ingress Finalizer 제거 및 삭제 (★ 수정됨)
       # ========================================================================
-      - name: Delete All Ingresses
+      - name: Delete All Ingresses with Finalizer Removal
         if: steps.check-eks.outputs.cluster_exists == 'true'
         run: |
-          echo "=== Ingress 삭제 ==="
+          echo "=============================================="
+          echo "=== Ingress Finalizer 제거 및 삭제 ==="
+          echo "=============================================="
+          
+          # 모든 네임스페이스의 Ingress 조회 및 Finalizer 제거
+          echo "=== 1. Ingress Finalizer 제거 ==="
+          for NS in $(kubectl get ns -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            INGRESSES=$(kubectl get ingress -n $NS -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+            for ING in $INGRESSES; do
+              if [ -n "$ING" ]; then
+                echo "Processing ingress/$ING in namespace $NS"
+                
+                # Finalizer 제거 (여러 방법 시도)
+                kubectl patch ingress $ING -n $NS --type=merge \
+                  -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+                kubectl patch ingress $ING -n $NS --type=json \
+                  -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+              fi
+            done
+          done
+          
+          # Ingress 강제 삭제
+          echo ""
+          echo "=== 2. Ingress 강제 삭제 ==="
           kubectl delete ingress --all -A --force --grace-period=0 2>/dev/null || true
+          
+          # 삭제 대기
+          echo "=== 삭제 대기 (15초) ==="
+          sleep 15
+          
+          # 남은 Ingress 확인 및 재시도
+          echo ""
+          echo "=== 3. 남은 Ingress 재확인 및 재시도 ==="
+          REMAINING_INGRESSES=$(kubectl get ingress -A --no-headers 2>/dev/null || true)
+          if [ -n "$REMAINING_INGRESSES" ]; then
+            echo "⚠️ 남은 Ingress 발견:"
+            echo "$REMAINING_INGRESSES"
+            echo ""
+            echo "재시도 중..."
+            
+            # 개별 처리
+            kubectl get ingress -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null | \
+            while read NS ING; do
+              if [ -n "$NS" ] && [ -n "$ING" ]; then
+                echo "  Force deleting: $NS/$ING"
+                kubectl patch ingress $ING -n $NS --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+                kubectl delete ingress $ING -n $NS --force --grace-period=0 --timeout=30s 2>/dev/null || true
+              fi
+            done
+            
+            sleep 10
+          fi
+          
+          # 최종 상태 확인
+          echo ""
+          echo "=== Ingress 최종 상태 ==="
+          kubectl get ingress -A 2>/dev/null || echo "No ingresses found ✅"
+          
+          echo ""
           echo "✅ Ingress 삭제 완료"
 
+      # ========================================================================
+      # ALB 및 Target Group 삭제
+      # ========================================================================
       - name: Delete ALBs and Target Groups
         run: |
+          echo "=============================================="
           echo "=== ALB 삭제 ==="
+          echo "=============================================="
+          
+          # k8s- 또는 프로젝트명 포함 ALB 삭제
           aws elbv2 describe-load-balancers --query 'LoadBalancers[*].[LoadBalancerArn,LoadBalancerName]' --output text 2>/dev/null | \
           while IFS=$'\t' read -r ARN NAME; do
             if [ -n "$ARN" ] && [ "$ARN" != "None" ]; then
               if [[ "$NAME" == *petclinic* ]] || [[ "$NAME" == *argocd* ]] || [[ "$NAME" == k8s-* ]]; then
-                echo "Deleting ALB: $NAME"
+                echo "Deleting ALB: $NAME ($ARN)"
+                
+                # 리스너 먼저 삭제
                 LISTENERS=$(aws elbv2 describe-listeners --load-balancer-arn "$ARN" --query 'Listeners[*].ListenerArn' --output text 2>/dev/null || true)
                 for L in $LISTENERS; do
-                  aws elbv2 delete-listener --listener-arn "$L" 2>/dev/null || true
+                  if [ -n "$L" ] && [ "$L" != "None" ]; then
+                    echo "  Deleting listener: $L"
+                    aws elbv2 delete-listener --listener-arn "$L" 2>/dev/null || true
+                  fi
                 done
+                
+                # ALB 삭제
                 aws elbv2 delete-load-balancer --load-balancer-arn "$ARN" 2>/dev/null || true
+                echo "  ✓ ALB 삭제 요청 완료"
               fi
             fi
           done
           
+          echo ""
           echo "=== ALB 삭제 대기 (60초) ==="
           sleep 60
           
+          echo ""
           echo "=== Target Group 삭제 ==="
           aws elbv2 describe-target-groups --query 'TargetGroups[*].[TargetGroupArn,TargetGroupName]' --output text 2>/dev/null | \
           while IFS=$'\t' read -r ARN NAME; do
             if [ -n "$ARN" ] && [ "$ARN" != "None" ]; then
               if [[ "$NAME" == *petclinic* ]] || [[ "$NAME" == *argocd* ]] || [[ "$NAME" == k8s-* ]]; then
-                echo "Deleting TG: $NAME"
+                echo "Deleting Target Group: $NAME"
                 aws elbv2 delete-target-group --target-group-arn "$ARN" 2>/dev/null || true
               fi
             fi
           done
+          
+          echo ""
+          echo "✅ ALB 및 Target Group 삭제 완료"
 
       # ========================================================================
       # Namespace 정리
@@ -595,20 +673,25 @@ jobs:
           echo "=== Namespace 정리 ==="
           for NS in petclinic monitoring argocd external-secrets; do
             if kubectl get namespace $NS > /dev/null 2>&1; then
+              echo "Processing namespace: $NS"
               kubectl delete all --all -n $NS --force --grace-period=0 2>/dev/null || true
               kubectl patch namespace $NS --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
               kubectl delete namespace $NS --force --grace-period=0 2>/dev/null || true
               
-              # 강제 삭제
+              # 강제 삭제 (API 직접 호출)
               kubectl get namespace $NS -o json 2>/dev/null | \
                 jq '.spec.finalizers = []' | \
                 kubectl replace --raw "/api/v1/namespaces/$NS/finalize" -f - 2>/dev/null || true
             fi
           done
+          
+          echo "✅ Namespace 정리 완료"
 
       - name: Pre-Cleanup Summary
         run: |
+          echo "=============================================="
           echo "✅ Pre-cleanup 완료!"
+          echo "=============================================="
 
   # ============================================================================
   # AWS 리소스 강제 삭제
@@ -1004,7 +1087,11 @@ jobs:
       - name: Create SSH Key
         run: |
           mkdir -p keys
-          echo "${{ secrets.SSH_PUBLIC_KEY }}" > keys/test.pub
+          if [ -n "${{ secrets.SSH_PUBLIC_KEY }}" ]; then
+            echo "${{ secrets.SSH_PUBLIC_KEY }}" > keys/test.pub
+          else
+            ssh-keygen -t rsa -b 4096 -f keys/test -N "" -q
+          fi
 
       - name: Destroy Bootstrap
         if: github.event.inputs.layer == 'all' || github.event.inputs.layer == 'bootstrap'
@@ -1035,7 +1122,10 @@ jobs:
 
       - name: Verify Destruction
         run: |
+          echo "=============================================="
           echo "=== 삭제 검증 ==="
+          echo "=============================================="
+          echo ""
           echo "EKS 클러스터:"
           aws eks list-clusters --query 'clusters' --output text || echo "None"
           echo ""
@@ -1047,9 +1137,14 @@ jobs:
           echo ""
           echo "EC2 인스턴스 (petclinic 관련):"
           aws ec2 describe-instances --filters "Name=tag:Name,Values=*petclinic*" "Name=instance-state-name,Values=running" --query 'Reservations[*].Instances[*].InstanceId' --output text || echo "None"
+          echo ""
+          echo "ALB:"
+          aws elbv2 describe-load-balancers --query 'LoadBalancers[?contains(LoadBalancerName, `k8s-`) || contains(LoadBalancerName, `petclinic`)].LoadBalancerName' --output text || echo "None"
 
       - name: Destroy Complete
         run: |
+          echo "=============================================="
           echo "🎉 Terraform Destroy 완료!"
+          echo "=============================================="
           echo ""
           echo "삭제된 레이어: ${{ github.event.inputs.layer }}"
