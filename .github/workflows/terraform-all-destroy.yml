@@ -106,227 +106,343 @@ jobs:
           aws eks update-kubeconfig --name ${{ steps.check-eks.outputs.cluster_name }} --region ${{ env.AWS_REGION }}
 
       # ========================================================================
-      # 1단계: Karpenter 완전 강제 삭제 (가장 먼저!)
+      # 1단계: Karpenter Controller 완전 중지 (새 노드 생성 방지)
       # ========================================================================
-      - name: Force Delete Karpenter - Step 1 - Stop Controller
+      - name: Karpenter Step 1 - Stop Controller First
         if: steps.check-eks.outputs.cluster_exists == 'true'
         run: |
           echo "=============================================="
           echo "=== 1단계: Karpenter Controller 완전 중지 ==="
           echo "=============================================="
           
-          # Deployment 스케일 다운
-          kubectl scale deploy karpenter -n kube-system --replicas=0 2>/dev/null || true
-          
-          # Deployment 자체 삭제
-          kubectl delete deploy karpenter -n kube-system --force --grace-period=0 2>/dev/null || true
+          # Deployment 스케일 다운 (즉시)
+          kubectl scale deploy karpenter -n kube-system --replicas=0 --timeout=30s 2>/dev/null || true
           
           # 모든 Karpenter Pod 강제 삭제
           kubectl delete pods -l app.kubernetes.io/name=karpenter -n kube-system --force --grace-period=0 2>/dev/null || true
           
+          # Deployment 자체 삭제
+          kubectl delete deploy karpenter -n kube-system --force --grace-period=0 2>/dev/null || true
+          
           # ServiceAccount 삭제 (재생성 방지)
           kubectl delete sa karpenter -n kube-system --force --grace-period=0 2>/dev/null || true
           
-          echo "=== Controller 중지 대기 (15초) ==="
-          sleep 15
+          # Webhook 삭제 (NodeClaim 삭제 차단 방지)
+          kubectl delete validatingwebhookconfiguration karpenter-validation 2>/dev/null || true
+          kubectl delete mutatingwebhookconfiguration karpenter-mutation 2>/dev/null || true
+          
+          echo "=== Controller 완전 중지 대기 (20초) ==="
+          sleep 20
           
           # 확인
-          echo "=== Karpenter Pod 상태 확인 ==="
-          kubectl get pods -n kube-system -l app.kubernetes.io/name=karpenter 2>/dev/null || echo "No Karpenter pods found"
+          echo "=== Karpenter Pod 상태 ==="
+          kubectl get pods -n kube-system -l app.kubernetes.io/name=karpenter 2>/dev/null || echo "No Karpenter pods"
           
           echo "✅ Karpenter Controller 중지 완료"
 
-      - name: Force Delete Karpenter - Step 2 - Delete NodeClaims
+      # ========================================================================
+      # 2단계: Karpenter EC2 인스턴스 먼저 종료 (NodeClaim 삭제 전!)
+      # ========================================================================
+      - name: Karpenter Step 2 - Terminate EC2 Instances First
         if: steps.check-eks.outputs.cluster_exists == 'true'
         run: |
           echo "=============================================="
-          echo "=== 2단계: NodeClaim 강제 삭제 ==="
+          echo "=== 2단계: Karpenter EC2 인스턴스 먼저 종료 ==="
           echo "=============================================="
           
-          # 모든 NodeClaim 조회
-          NODECLAIMS=$(kubectl get nodeclaims -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+          # 여러 태그 패턴으로 Karpenter 노드 찾기
+          echo "=== Karpenter 노드 검색 ==="
           
-          if [ -n "$NODECLAIMS" ]; then
-            for NC in $NODECLAIMS; do
-              echo "Processing NodeClaim: $NC"
-              
-              # Finalizer 강제 제거 (JSON patch)
-              kubectl patch nodeclaim $NC --type=json \
-                -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
-              
-              # Merge patch로도 시도
-              kubectl patch nodeclaim $NC --type=merge \
-                -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
-              
-              # 삭제
-              kubectl delete nodeclaim $NC --force --grace-period=0 2>/dev/null || true
-            done
-          fi
-          
-          # 전체 삭제 한번 더
-          kubectl delete nodeclaims --all --force --grace-period=0 2>/dev/null || true
-          
-          echo "=== NodeClaim 삭제 대기 (10초) ==="
-          sleep 10
-          
-          # 확인
-          echo "=== NodeClaim 상태 확인 ==="
-          kubectl get nodeclaims 2>/dev/null || echo "No NodeClaims found"
-          
-          echo "✅ NodeClaim 삭제 완료"
-
-      - name: Force Delete Karpenter - Step 3 - Delete NodePools
-        if: steps.check-eks.outputs.cluster_exists == 'true'
-        run: |
-          echo "=============================================="
-          echo "=== 3단계: NodePool 강제 삭제 ==="
-          echo "=============================================="
-          
-          # 모든 NodePool 조회
-          NODEPOOLS=$(kubectl get nodepools -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
-          
-          if [ -n "$NODEPOOLS" ]; then
-            for NP in $NODEPOOLS; do
-              echo "Processing NodePool: $NP"
-              
-              # Finalizer 강제 제거
-              kubectl patch nodepool $NP --type=json \
-                -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
-              
-              kubectl patch nodepool $NP --type=merge \
-                -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
-              
-              # 삭제
-              kubectl delete nodepool $NP --force --grace-period=0 2>/dev/null || true
-            done
-          fi
-          
-          # 전체 삭제
-          kubectl delete nodepools --all --force --grace-period=0 2>/dev/null || true
-          
-          echo "=== NodePool 삭제 대기 (5초) ==="
-          sleep 5
-          
-          echo "=== NodePool 상태 확인 ==="
-          kubectl get nodepools 2>/dev/null || echo "No NodePools found"
-          
-          echo "✅ NodePool 삭제 완료"
-
-      - name: Force Delete Karpenter - Step 4 - Delete EC2NodeClasses
-        if: steps.check-eks.outputs.cluster_exists == 'true'
-        run: |
-          echo "=============================================="
-          echo "=== 4단계: EC2NodeClass 강제 삭제 ==="
-          echo "=============================================="
-          
-          # 모든 EC2NodeClass 조회
-          EC2NODECLASSES=$(kubectl get ec2nodeclasses -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
-          
-          if [ -n "$EC2NODECLASSES" ]; then
-            for EC2NC in $EC2NODECLASSES; do
-              echo "Processing EC2NodeClass: $EC2NC"
-              
-              # Finalizer 강제 제거
-              kubectl patch ec2nodeclass $EC2NC --type=json \
-                -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
-              
-              kubectl patch ec2nodeclass $EC2NC --type=merge \
-                -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
-              
-              # 삭제
-              kubectl delete ec2nodeclass $EC2NC --force --grace-period=0 2>/dev/null || true
-            done
-          fi
-          
-          # 전체 삭제
-          kubectl delete ec2nodeclasses --all --force --grace-period=0 2>/dev/null || true
-          
-          echo "=== EC2NodeClass 삭제 대기 (5초) ==="
-          sleep 5
-          
-          echo "=== EC2NodeClass 상태 확인 ==="
-          kubectl get ec2nodeclasses 2>/dev/null || echo "No EC2NodeClasses found"
-          
-          echo "✅ EC2NodeClass 삭제 완료"
-
-      - name: Force Delete Karpenter - Step 5 - Delete CRDs
-        if: steps.check-eks.outputs.cluster_exists == 'true'
-        run: |
-          echo "=============================================="
-          echo "=== 5단계: Karpenter CRD 강제 삭제 ==="
-          echo "=============================================="
-          
-          KARPENTER_CRDS="nodeclaims.karpenter.sh nodepools.karpenter.sh ec2nodeclasses.karpenter.k8s.aws"
-          
-          for CRD in $KARPENTER_CRDS; do
-            if kubectl get crd $CRD > /dev/null 2>&1; then
-              echo "Processing CRD: $CRD"
-              
-              # CRD Finalizer 제거
-              kubectl patch crd $CRD --type=json \
-                -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
-              
-              kubectl patch crd $CRD --type=merge \
-                -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
-              
-              # 백그라운드로 삭제
-              kubectl delete crd $CRD --force --grace-period=0 &
-            fi
-          done
-          
-          echo "=== CRD 삭제 대기 (10초) ==="
-          sleep 10
-          
-          echo "=== Karpenter CRD 상태 확인 ==="
-          kubectl get crd | grep karpenter 2>/dev/null || echo "No Karpenter CRDs found"
-          
-          echo "✅ Karpenter CRD 삭제 완료"
-
-      - name: Force Delete Karpenter - Step 6 - Terminate EC2 Instances
-        if: steps.check-eks.outputs.cluster_exists == 'true'
-        run: |
-          echo "=============================================="
-          echo "=== 6단계: Karpenter EC2 인스턴스 강제 종료 ==="
-          echo "=============================================="
-          
-          # 방법 1: karpenter.sh/nodepool 태그로 찾기
-          echo "=== 태그 기반 검색 ==="
-          KARPENTER_INSTANCES=$(aws ec2 describe-instances \
+          # 패턴 1: karpenter.sh/nodepool 태그
+          INSTANCES1=$(aws ec2 describe-instances \
             --filters "Name=tag-key,Values=karpenter.sh/nodepool" \
                       "Name=instance-state-name,Values=running,pending,stopping,stopped" \
             --query 'Reservations[*].Instances[*].InstanceId' \
             --output text 2>/dev/null || true)
           
-          # 방법 2: node-type=karpenter 태그로도 찾기
-          KARPENTER_INSTANCES2=$(aws ec2 describe-instances \
-            --filters "Name=tag:node-type,Values=karpenter" \
-                      "Name=instance-state-name,Values=running,pending,stopping,stopped" \
-            --query 'Reservations[*].Instances[*].InstanceId' \
-            --output text 2>/dev/null || true)
-          
-          # 방법 3: karpenter.sh/managed-by 태그로도 찾기
-          KARPENTER_INSTANCES3=$(aws ec2 describe-instances \
+          # 패턴 2: karpenter.sh/managed-by 태그
+          INSTANCES2=$(aws ec2 describe-instances \
             --filters "Name=tag-key,Values=karpenter.sh/managed-by" \
                       "Name=instance-state-name,Values=running,pending,stopping,stopped" \
             --query 'Reservations[*].Instances[*].InstanceId' \
             --output text 2>/dev/null || true)
           
-          # 모든 인스턴스 합치기
-          ALL_INSTANCES="$KARPENTER_INSTANCES $KARPENTER_INSTANCES2 $KARPENTER_INSTANCES3"
-          UNIQUE_INSTANCES=$(echo $ALL_INSTANCES | tr ' ' '\n' | sort -u | tr '\n' ' ')
+          # 패턴 3: karpenter.sh/nodeclaim 태그
+          INSTANCES3=$(aws ec2 describe-instances \
+            --filters "Name=tag-key,Values=karpenter.sh/nodeclaim" \
+                      "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text 2>/dev/null || true)
+          
+          # 패턴 4: node-type=karpenter 태그
+          INSTANCES4=$(aws ec2 describe-instances \
+            --filters "Name=tag:node-type,Values=karpenter" \
+                      "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text 2>/dev/null || true)
+          
+          # 모든 인스턴스 합치고 중복 제거
+          ALL_INSTANCES="$INSTANCES1 $INSTANCES2 $INSTANCES3 $INSTANCES4"
+          UNIQUE_INSTANCES=$(echo $ALL_INSTANCES | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
           
           if [ -n "$UNIQUE_INSTANCES" ] && [ "$UNIQUE_INSTANCES" != " " ]; then
-            echo "Terminating Karpenter instances: $UNIQUE_INSTANCES"
+            echo "종료할 Karpenter 인스턴스: $UNIQUE_INSTANCES"
+            
+            # 인스턴스 종료
             aws ec2 terminate-instances --instance-ids $UNIQUE_INSTANCES 2>/dev/null || true
             
-            echo "=== EC2 인스턴스 종료 대기 (60초) ==="
-            sleep 60
+            echo "=== EC2 종료 대기 (90초) ==="
+            sleep 90
+            
+            # 종료 확인
+            echo "=== 종료 상태 확인 ==="
+            for INST in $UNIQUE_INSTANCES; do
+              STATE=$(aws ec2 describe-instances --instance-ids $INST \
+                --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "terminated")
+              echo "  $INST: $STATE"
+            done
           else
             echo "ℹ️ Karpenter 인스턴스 없음"
           fi
           
           echo "✅ Karpenter EC2 인스턴스 종료 완료"
 
+      # ========================================================================
+      # 3단계: NodeClaim 강제 삭제 (EC2 종료 후)
+      # ========================================================================
+      - name: Karpenter Step 3 - Force Delete NodeClaims
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "=============================================="
+          echo "=== 3단계: NodeClaim 강제 삭제 ==="
+          echo "=============================================="
+          
+          # 모든 NodeClaim 조회
+          NODECLAIMS=$(kubectl get nodeclaims -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+          
+          if [ -n "$NODECLAIMS" ]; then
+            echo "발견된 NodeClaims: $NODECLAIMS"
+            
+            for NC in $NODECLAIMS; do
+              echo "=== Processing NodeClaim: $NC ==="
+              
+              # 방법 1: JSON Patch로 Finalizer 제거
+              kubectl patch nodeclaim $NC --type=json \
+                -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+              
+              # 방법 2: Merge Patch로 Finalizer null 설정
+              kubectl patch nodeclaim $NC --type=merge \
+                -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+              
+              # 방법 3: Strategic Merge Patch
+              kubectl patch nodeclaim $NC --type=strategic \
+                -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+              
+              # 삭제 시도
+              kubectl delete nodeclaim $NC --force --grace-period=0 --timeout=30s 2>/dev/null &
+            done
+            
+            # 백그라운드 삭제 대기
+            wait 2>/dev/null || true
+            
+            # 남은 NodeClaim 한번 더 정리
+            kubectl delete nodeclaims --all --force --grace-period=0 2>/dev/null || true
+          else
+            echo "ℹ️ NodeClaim 없음"
+          fi
+          
+          echo "=== NodeClaim 삭제 대기 (15초) ==="
+          sleep 15
+          
+          # 확인
+          echo "=== NodeClaim 상태 ==="
+          kubectl get nodeclaims 2>/dev/null || echo "No NodeClaims found"
+          
+          echo "✅ NodeClaim 삭제 완료"
+
+      # ========================================================================
+      # 4단계: NodePool 강제 삭제
+      # ========================================================================
+      - name: Karpenter Step 4 - Force Delete NodePools
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "=============================================="
+          echo "=== 4단계: NodePool 강제 삭제 ==="
+          echo "=============================================="
+          
+          NODEPOOLS=$(kubectl get nodepools -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+          
+          if [ -n "$NODEPOOLS" ]; then
+            echo "발견된 NodePools: $NODEPOOLS"
+            
+            for NP in $NODEPOOLS; do
+              echo "=== Processing NodePool: $NP ==="
+              
+              # Finalizer 제거
+              kubectl patch nodepool $NP --type=json \
+                -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+              kubectl patch nodepool $NP --type=merge \
+                -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+              
+              # 삭제
+              kubectl delete nodepool $NP --force --grace-period=0 2>/dev/null || true
+            done
+            
+            kubectl delete nodepools --all --force --grace-period=0 2>/dev/null || true
+          else
+            echo "ℹ️ NodePool 없음"
+          fi
+          
+          echo "=== NodePool 삭제 대기 (10초) ==="
+          sleep 10
+          
+          echo "=== NodePool 상태 ==="
+          kubectl get nodepools 2>/dev/null || echo "No NodePools found"
+          
+          echo "✅ NodePool 삭제 완료"
+
+      # ========================================================================
+      # 5단계: EC2NodeClass 강제 삭제
+      # ========================================================================
+      - name: Karpenter Step 5 - Force Delete EC2NodeClasses
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "=============================================="
+          echo "=== 5단계: EC2NodeClass 강제 삭제 ==="
+          echo "=============================================="
+          
+          EC2NODECLASSES=$(kubectl get ec2nodeclasses -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+          
+          if [ -n "$EC2NODECLASSES" ]; then
+            echo "발견된 EC2NodeClasses: $EC2NODECLASSES"
+            
+            for EC2NC in $EC2NODECLASSES; do
+              echo "=== Processing EC2NodeClass: $EC2NC ==="
+              
+              # Finalizer 제거
+              kubectl patch ec2nodeclass $EC2NC --type=json \
+                -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+              kubectl patch ec2nodeclass $EC2NC --type=merge \
+                -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+              
+              # 삭제
+              kubectl delete ec2nodeclass $EC2NC --force --grace-period=0 2>/dev/null || true
+            done
+            
+            kubectl delete ec2nodeclasses --all --force --grace-period=0 2>/dev/null || true
+          else
+            echo "ℹ️ EC2NodeClass 없음"
+          fi
+          
+          echo "=== EC2NodeClass 삭제 대기 (10초) ==="
+          sleep 10
+          
+          echo "=== EC2NodeClass 상태 ==="
+          kubectl get ec2nodeclasses 2>/dev/null || echo "No EC2NodeClasses found"
+          
+          echo "✅ EC2NodeClass 삭제 완료"
+
+      # ========================================================================
+      # 6단계: Karpenter CRD 강제 삭제
+      # ========================================================================
+      - name: Karpenter Step 6 - Force Delete CRDs
+        if: steps.check-eks.outputs.cluster_exists == 'true'
+        run: |
+          echo "=============================================="
+          echo "=== 6단계: Karpenter CRD 강제 삭제 ==="
+          echo "=============================================="
+          
+          KARPENTER_CRDS=$(kubectl get crd -o name 2>/dev/null | grep karpenter || true)
+          
+          if [ -n "$KARPENTER_CRDS" ]; then
+            echo "발견된 Karpenter CRDs:"
+            echo "$KARPENTER_CRDS"
+            
+            for CRD in $KARPENTER_CRDS; do
+              CRD_NAME=$(echo $CRD | sed 's|customresourcedefinition.apiextensions.k8s.io/||')
+              echo "=== Processing CRD: $CRD_NAME ==="
+              
+              # Finalizer 제거
+              kubectl patch crd $CRD_NAME --type=json \
+                -p='[{"op": "remove", "path": "/metadata/finalizers"}]' 2>/dev/null || true
+              kubectl patch crd $CRD_NAME --type=merge \
+                -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+              
+              # 백그라운드 삭제
+              kubectl delete crd $CRD_NAME --force --grace-period=0 &
+            done
+            
+            # 백그라운드 삭제 대기
+            sleep 15
+            wait 2>/dev/null || true
+          else
+            echo "ℹ️ Karpenter CRD 없음"
+          fi
+          
+          echo "=== Karpenter CRD 상태 ==="
+          kubectl get crd 2>/dev/null | grep karpenter || echo "No Karpenter CRDs found"
+          
+          echo "✅ Karpenter CRD 삭제 완료"
+
+      # ========================================================================
+      # 7단계: Karpenter가 생성한 AWS 리소스 삭제
+      # ========================================================================
+      - name: Karpenter Step 7 - Delete AWS Resources (Instance Profiles & Launch Templates)
+        run: |
+          echo "=============================================="
+          echo "=== 7단계: Karpenter AWS 리소스 삭제 ==="
+          echo "=============================================="
+          
+          # Karpenter가 생성한 Instance Profile 삭제
+          echo "=== Instance Profile 삭제 ==="
+          INSTANCE_PROFILES=$(aws iam list-instance-profiles \
+            --query "InstanceProfiles[?contains(InstanceProfileName, '${{ env.PROJECT_NAME }}-eks_')].InstanceProfileName" \
+            --output text 2>/dev/null || true)
+          
+          for IP in $INSTANCE_PROFILES; do
+            echo "Processing Instance Profile: $IP"
+            
+            # Role 분리
+            ROLES=$(aws iam get-instance-profile --instance-profile-name $IP \
+              --query 'InstanceProfile.Roles[*].RoleName' --output text 2>/dev/null || true)
+            for ROLE in $ROLES; do
+              echo "  Removing role: $ROLE"
+              aws iam remove-role-from-instance-profile \
+                --instance-profile-name $IP --role-name $ROLE 2>/dev/null || true
+            done
+            
+            # Instance Profile 삭제
+            aws iam delete-instance-profile --instance-profile-name $IP 2>/dev/null || true
+            echo "  ✓ Deleted: $IP"
+          done
+          
+          # Karpenter가 생성한 Launch Template 삭제
+          echo ""
+          echo "=== Launch Template 삭제 ==="
+          LAUNCH_TEMPLATES=$(aws ec2 describe-launch-templates \
+            --query "LaunchTemplates[?contains(LaunchTemplateName, 'karpenter')].LaunchTemplateId" \
+            --output text 2>/dev/null || true)
+          
+          for LT in $LAUNCH_TEMPLATES; do
+            echo "Deleting Launch Template: $LT"
+            aws ec2 delete-launch-template --launch-template-id $LT 2>/dev/null || true
+          done
+          
+          # 프로젝트 이름으로도 검색
+          LAUNCH_TEMPLATES2=$(aws ec2 describe-launch-templates \
+            --query "LaunchTemplates[?contains(LaunchTemplateName, '${{ env.PROJECT_NAME }}')].LaunchTemplateId" \
+            --output text 2>/dev/null || true)
+          
+          for LT in $LAUNCH_TEMPLATES2; do
+            echo "Deleting Launch Template: $LT"
+            aws ec2 delete-launch-template --launch-template-id $LT 2>/dev/null || true
+          done
+          
+          echo "✅ Karpenter AWS 리소스 삭제 완료"
+
+      # ========================================================================
+      # Karpenter 삭제 최종 확인
+      # ========================================================================
       - name: Karpenter Cleanup Summary
         if: steps.check-eks.outputs.cluster_exists == 'true'
         run: |
@@ -334,22 +450,29 @@ jobs:
           echo "=== Karpenter 정리 최종 확인 ==="
           echo "=============================================="
           echo ""
-          echo "NodeClaims:"
-          kubectl get nodeclaims 2>/dev/null || echo "  None"
+          echo "📋 Kubernetes 리소스:"
+          echo "  NodeClaims:"
+          kubectl get nodeclaims 2>/dev/null || echo "    None"
+          echo "  NodePools:"
+          kubectl get nodepools 2>/dev/null || echo "    None"
+          echo "  EC2NodeClasses:"
+          kubectl get ec2nodeclasses 2>/dev/null || echo "    None"
+          echo "  Karpenter CRDs:"
+          kubectl get crd 2>/dev/null | grep karpenter || echo "    None"
+          echo "  Karpenter Pods:"
+          kubectl get pods -n kube-system -l app.kubernetes.io/name=karpenter 2>/dev/null || echo "    None"
           echo ""
-          echo "NodePools:"
-          kubectl get nodepools 2>/dev/null || echo "  None"
-          echo ""
-          echo "EC2NodeClasses:"
-          kubectl get ec2nodeclasses 2>/dev/null || echo "  None"
-          echo ""
-          echo "Karpenter CRDs:"
-          kubectl get crd | grep karpenter 2>/dev/null || echo "  None"
+          echo "📋 AWS 리소스:"
+          echo "  Karpenter EC2 인스턴스:"
+          aws ec2 describe-instances \
+            --filters "Name=tag-key,Values=karpenter.sh/nodepool" \
+                      "Name=instance-state-name,Values=running,pending" \
+            --query 'Reservations[*].Instances[*].InstanceId' --output text 2>/dev/null || echo "    None"
           echo ""
           echo "✅ Karpenter 강제 삭제 완료!"
 
       # ========================================================================
-      # 2단계: ArgoCD 정리
+      # ArgoCD 정리
       # ========================================================================
       - name: Stop ArgoCD Components
         if: steps.check-eks.outputs.cluster_exists == 'true'
@@ -397,7 +520,7 @@ jobs:
           echo "✅ ArgoCD 정리 완료"
 
       # ========================================================================
-      # 3단계: External Secrets 정리
+      # External Secrets 정리
       # ========================================================================
       - name: Cleanup External Secrets
         if: steps.check-eks.outputs.cluster_exists == 'true'
@@ -423,7 +546,7 @@ jobs:
           echo "✅ External Secrets 정리 완료"
 
       # ========================================================================
-      # 4단계: Ingress 및 ALB 정리
+      # Ingress 및 ALB 정리
       # ========================================================================
       - name: Delete All Ingresses
         if: steps.check-eks.outputs.cluster_exists == 'true'
@@ -464,7 +587,7 @@ jobs:
           done
 
       # ========================================================================
-      # 5단계: Namespace 정리
+      # Namespace 정리
       # ========================================================================
       - name: Cleanup Namespaces
         if: steps.check-eks.outputs.cluster_exists == 'true'
@@ -533,6 +656,37 @@ jobs:
           else
             echo "ℹ️ 남은 Karpenter 인스턴스 없음"
           fi
+
+      # ========================================================================
+      # Karpenter Instance Profile 최종 정리
+      # ========================================================================
+      - name: Final Karpenter Instance Profile Cleanup
+        run: |
+          echo "=== Karpenter Instance Profile 최종 정리 ==="
+          
+          # 프로젝트명_숫자 패턴의 Instance Profile (Karpenter 자동 생성)
+          INSTANCE_PROFILES=$(aws iam list-instance-profiles \
+            --query 'InstanceProfiles[*].InstanceProfileName' --output text 2>/dev/null || true)
+          
+          for IP in $INSTANCE_PROFILES; do
+            if [[ "$IP" == "${{ env.PROJECT_NAME }}-eks_"* ]] || [[ "$IP" == *"karpenter"* ]]; then
+              echo "Processing: $IP"
+              
+              # Role 분리
+              ROLES=$(aws iam get-instance-profile --instance-profile-name "$IP" \
+                --query 'InstanceProfile.Roles[*].RoleName' --output text 2>/dev/null || true)
+              for ROLE in $ROLES; do
+                aws iam remove-role-from-instance-profile \
+                  --instance-profile-name "$IP" --role-name "$ROLE" 2>/dev/null || true
+              done
+              
+              # Instance Profile 삭제
+              aws iam delete-instance-profile --instance-profile-name "$IP" 2>/dev/null || true
+              echo "  ✓ Deleted: $IP"
+            fi
+          done
+          
+          echo "✅ Instance Profile 정리 완료"
 
       # ========================================================================
       # EKS Node Group 삭제
