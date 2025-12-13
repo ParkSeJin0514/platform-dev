@@ -69,7 +69,6 @@ locals {
   # 시스템 노드 전용 레이블
   eks_node_labels = {
     "node-role" = "system"
-    "karpenter.sh/nodepool" = "system"  # Karpenter가 관리하지 않음을 표시
   }
   
   # 시스템 노드 전용 Taint (선택적)
