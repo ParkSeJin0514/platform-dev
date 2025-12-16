@@ -267,3 +267,5 @@ aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
 | **platform-gitops** | GitOps 매니페스트 (Karpenter, ArgoCD Apps) |
 | **petclinic-gitops** | PetClinic 애플리케이션 GitOps |
 | **petclinic-dev** | PetClinic 소스 코드 + CI/CD |
+
+#test
